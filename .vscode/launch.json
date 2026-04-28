@@ -1,0 +1,12 @@
+{
+  "version": "0.2.0",
+  "configurations": [
+    {
+      "name": "Запуск приложения ГРЛ",
+      "type": "python",
+      "request": "launch",
+      "program": "${workspaceFolder}/gpr_anomaly_app.py",
+      "console": "integratedTerminal"
+    }
+  ]
+}
