@@ -1,6 +1,9 @@
 import csv
+import array
 import math
 import random
+import re
+import struct
 import statistics
 import tkinter as tk
 from dataclasses import dataclass
@@ -10,6 +13,9 @@ from tkinter import filedialog, messagebox, ttk
 
 SAMPLE_COUNT = 240
 TRACE_COUNT = 96
+MAX_PREVIEW_TRACES = 700
+MAX_PREVIEW_SAMPLES = 900
+MAX_PREVIEW_CELLS = MAX_PREVIEW_TRACES * MAX_PREVIEW_SAMPLES
 
 
 @dataclass
@@ -19,6 +25,20 @@ class DetectionResult:
     score: float
     amplitude: float
     label: str
+    trace_from: int = 0
+    trace_to: int = 0
+    sample_from: int = 0
+    sample_to: int = 0
+    area: int = 1
+    confidence: float = 0.0
+    reason: str = ""
+
+
+@dataclass
+class ImportResult:
+    data: list
+    source_type: str
+    details: str
 
 
 class GPRProcessor:
@@ -55,7 +75,261 @@ class GPRProcessor:
         return data
 
     @staticmethod
+    def load_file(path):
+        path = Path(path)
+        suffix = path.suffix.lower()
+        if suffix == ".csv":
+            data = GPRProcessor.load_text_matrix(path)
+            return ImportResult(data, "CSV", "текстовая матрица амплитуд")
+        if suffix in {".gpr", ".gpr2", ".txt", ".dat"}:
+            return GPRProcessor.load_gpr(path)
+        raise ValueError("Поддерживаются файлы .csv, .gpr, .gpr2, .txt, .dat")
+
+    @staticmethod
+    def load_gpr(path):
+        path = Path(path)
+        size_mb = path.stat().st_size / (1024 * 1024)
+        if size_mb > 350:
+            raise ValueError(
+                "Файл слишком большой для прямой загрузки в настольный интерфейс. "
+                "Разделите профиль на фрагменты или экспортируйте участок в CSV/GPR меньшего размера."
+            )
+        raw = path.read_bytes()
+        if not raw:
+            raise ValueError("Файл пустой")
+
+        text_result = GPRProcessor.try_load_text_bytes(raw)
+        if text_result:
+            return ImportResult(text_result, path.suffix.upper(), "распознан как текстовая матрица")
+
+        known_result = GPRProcessor.try_load_known_gpr2(raw)
+        if known_result:
+            data, details = known_result
+            data, preview_details = GPRProcessor.prepare_preview_matrix(data)
+            if preview_details:
+                details = f"{details}; {preview_details}"
+            return ImportResult(data, path.suffix.upper(), details)
+
+        data, details = GPRProcessor.load_binary_gpr(raw)
+        data, preview_details = GPRProcessor.prepare_preview_matrix(data)
+        if preview_details:
+            details = f"{details}; {preview_details}"
+        return ImportResult(data, path.suffix.upper(), details)
+
+    @staticmethod
+    def try_load_text_bytes(raw):
+        head = raw[:4096]
+        printable = sum(32 <= byte <= 126 or byte in (9, 10, 13) for byte in head)
+        if printable / max(1, len(head)) < 0.82:
+            return None
+        for encoding in ("utf-8-sig", "cp1251", "latin-1"):
+            try:
+                text = raw.decode(encoding)
+            except UnicodeDecodeError:
+                continue
+            rows = GPRProcessor.parse_numeric_lines(text)
+            if rows:
+                return rows
+        return None
+
+    @staticmethod
+    def parse_numeric_lines(text):
+        rows = []
+        splitter = re.compile(r"[;,\s]+")
+        for line_number, line in enumerate(text.splitlines(), start=1):
+            line = line.strip()
+            if not line or line.startswith(("#", "//")):
+                continue
+            parts = [part for part in splitter.split(line) if part]
+            if len(parts) < 4:
+                continue
+            try:
+                row = [float(part.replace(",", ".")) for part in parts]
+            except ValueError:
+                continue
+            rows.append(row)
+
+        if len(rows) < 4:
+            return None
+        width = len(rows[0])
+        rows = [row for row in rows if len(row) == width]
+        if len(rows) < 4 or width < 4:
+            return None
+        rows, _details = GPRProcessor.prepare_preview_matrix(rows)
+        return rows
+
+    @staticmethod
+    def try_load_known_gpr2(raw):
+        if len(raw) < 160:
+            return None
+        magic = struct.unpack_from("<I", raw, 0)[0]
+        if magic != 0xFEDCBA98:
+            return None
+
+        trace_count = struct.unpack_from("<I", raw, 24)[0]
+        sample_count = struct.unpack_from("<I", raw, 28)[0]
+        channel_count = struct.unpack_from("<I", raw, 32)[0]
+        if not (8 <= trace_count <= 500000 and 16 <= sample_count <= 8192 and 1 <= channel_count <= 8):
+            return None
+
+        bytes_per_value = 2
+        data_bytes = trace_count * sample_count * channel_count * bytes_per_value
+        data_offset = len(raw) - data_bytes
+        if data_offset < 0 or data_offset >= len(raw):
+            return None
+
+        values = array.array("h")
+        values.frombytes(raw[data_offset : data_offset + data_bytes])
+        if len(values) < trace_count * sample_count * channel_count:
+            return None
+
+        channel_scores = []
+        step_trace = max(1, trace_count // 600)
+        step_sample = max(1, sample_count // 200)
+        for channel in range(channel_count):
+            sample_values = []
+            non_zero = 0
+            for trace in range(0, trace_count, step_trace):
+                for sample in range(0, sample_count, step_sample):
+                    index = (trace * sample_count + sample) * channel_count + channel
+                    value = values[index]
+                    sample_values.append(value)
+                    if value:
+                        non_zero += 1
+            if len(sample_values) < 2:
+                continue
+            stdev = statistics.pstdev(sample_values)
+            channel_scores.append((stdev * (non_zero / len(sample_values)), channel))
+
+        if not channel_scores:
+            return None
+        _score, selected_channel = max(channel_scores, key=lambda item: item[0])
+
+        data = []
+        for trace in range(trace_count):
+            row = []
+            base = trace * sample_count * channel_count
+            for sample in range(sample_count):
+                value = values[base + sample * channel_count + selected_channel]
+                row.append(float(value) / 32768.0)
+            data.append(row)
+
+        details = (
+            f"GPR2 parser: трасс={trace_count}, отсчетов={sample_count}, "
+            f"каналов={channel_count}, выбран канал={selected_channel + 1}, "
+            f"смещение данных={data_offset} байт"
+        )
+        return data, details
+
+    @staticmethod
+    def prepare_preview_matrix(data):
+        if not data or not data[0]:
+            return data, ""
+        rows = len(data)
+        cols = len(data[0])
+        if rows * cols <= MAX_PREVIEW_CELLS and rows <= MAX_PREVIEW_TRACES and cols <= MAX_PREVIEW_SAMPLES:
+            return data, ""
+
+        trace_step = max(1, math.ceil(rows / MAX_PREVIEW_TRACES))
+        sample_step = max(1, math.ceil(cols / MAX_PREVIEW_SAMPLES))
+        reduced = []
+        for trace in range(0, rows, trace_step):
+            trace_block = data[trace : min(rows, trace + trace_step)]
+            reduced_row = []
+            for sample in range(0, cols, sample_step):
+                total = 0.0
+                count = 0
+                sample_end = min(cols, sample + sample_step)
+                for source_row in trace_block:
+                    for value in source_row[sample:sample_end]:
+                        total += value
+                        count += 1
+                reduced_row.append(total / max(1, count))
+            reduced.append(reduced_row)
+
+        details = (
+            f"для стабильной работы интерфейса построен preview "
+            f"{len(reduced)}x{len(reduced[0])} из исходных {rows}x{cols}"
+        )
+        return reduced, details
+
+    @staticmethod
+    def decode_numeric_array(payload, dtype, size):
+        usable = len(payload) - (len(payload) % size)
+        type_code = {"int16": "h", "uint16": "H", "float32": "f"}[dtype]
+        values = array.array(type_code)
+        values.frombytes(payload[:usable])
+        if values.itemsize != size:
+            raise ValueError("Неподдерживаемый размер бинарного типа")
+        return values
+
+    @staticmethod
+    def scaled_values(values, dtype, scale, limit=None):
+        if limit is None:
+            source = values
+        else:
+            source = values[:limit]
+        if dtype == "uint16":
+            mean = sum(source) / max(1, len(source))
+            return [(float(value) - mean) / scale for value in source]
+        return [float(value) / scale for value in source]
+
+    @staticmethod
+    def load_binary_gpr(raw):
+        candidates = []
+        formats = [
+            ("int16", 2, "<h", 32768.0),
+            ("uint16", 2, "<H", 65535.0),
+            ("float32", 4, "<f", 1.0),
+        ]
+        widths = [128, 160, 200, 240, 256, 320, 400, 512, 768, 1024, 1500, 2048]
+
+        offsets = [0, 128, 256, 512, 1024, 2048, 4096, 8192]
+        for dtype, size, _fmt, scale in formats:
+            for offset in offsets:
+                if offset >= len(raw):
+                    continue
+                payload = raw[offset:]
+                usable = len(payload) - (len(payload) % size)
+                if usable < size * 64:
+                    continue
+                try:
+                    values = GPRProcessor.decode_numeric_array(payload[:usable], dtype, size)
+                except (ValueError, OverflowError):
+                    continue
+                sample_values = GPRProcessor.scaled_values(values, dtype, scale, limit=50000)
+
+                for width in widths:
+                    trace_count = len(values) // width
+                    if trace_count < 8:
+                        continue
+                    stdev = statistics.pstdev(sample_values)
+                    if not math.isfinite(stdev) or stdev < 1e-9:
+                        continue
+                    preference = 1.0 / (1.0 + abs(width - 512) / 512)
+                    score = trace_count * preference * min(stdev, 10)
+                    candidates.append((score, dtype, size, scale, width, trace_count, offset))
+
+        if not candidates:
+            raise ValueError(
+                "Не удалось распознать бинарный .gpr/.gpr2. Нужен пример файла или описание формата прибора."
+            )
+
+        _score, dtype, size, scale, width, trace_count, offset = max(candidates, key=lambda item: item[0])
+        payload = raw[offset:]
+        usable = len(payload) - (len(payload) % size)
+        numeric_values = GPRProcessor.decode_numeric_array(payload[:usable], dtype, size)
+        values = GPRProcessor.scaled_values(numeric_values, dtype, scale, limit=trace_count * width)
+        data = [values[index * width : (index + 1) * width] for index in range(trace_count)]
+        details = f"бинарный импорт: {dtype}, смещение={offset} байт, трасс={trace_count}, отсчетов={width}"
+        return data, details
+
+    @staticmethod
     def load_csv(path):
+        return GPRProcessor.load_text_matrix(path)
+
+    @staticmethod
+    def load_text_matrix(path):
         data = []
         with open(path, "r", newline="", encoding="utf-8-sig") as file:
             reader = csv.reader(file)
@@ -74,6 +348,7 @@ class GPRProcessor:
         width = len(data[0])
         if any(len(row) != width for row in data):
             raise ValueError("Все строки CSV должны иметь одинаковое количество отсчетов")
+        data, _details = GPRProcessor.prepare_preview_matrix(data)
         return data
 
     @staticmethod
@@ -115,46 +390,210 @@ class GPRProcessor:
         return smoothed
 
     @staticmethod
+    def dewow_filter(data, radius=18):
+        filtered = []
+        for row in data:
+            result_row = []
+            for index, value in enumerate(row):
+                left = max(0, index - radius)
+                right = min(len(row), index + radius + 1)
+                local_mean = sum(row[left:right]) / (right - left)
+                result_row.append(value - local_mean)
+            filtered.append(result_row)
+        return filtered
+
+    @staticmethod
+    def normalize_traces(data):
+        normalized = []
+        for row in data:
+            median = statistics.median(row)
+            mad = statistics.median([abs(value - median) for value in row]) or 1e-9
+            normalized.append([(value - median) / (1.4826 * mad) for value in row])
+        return normalized
+
+    @staticmethod
+    def lateral_smoothing(data, radius=1):
+        if radius <= 0:
+            return [row[:] for row in data]
+        rows = len(data)
+        cols = len(data[0])
+        result = []
+        for trace in range(rows):
+            left = max(0, trace - radius)
+            right = min(rows, trace + radius + 1)
+            row = []
+            for sample in range(cols):
+                row.append(sum(data[t][sample] for t in range(left, right)) / (right - left))
+            result.append(row)
+        return result
+
+    @staticmethod
     def preprocess(data, remove_background=True, gain=True, smoothing=True):
         processed = [row[:] for row in data]
+        processed = GPRProcessor.dewow_filter(processed)
         if remove_background:
             processed = GPRProcessor.mean_center(processed)
         if gain:
             processed = GPRProcessor.gain_compensation(processed)
         if smoothing:
             processed = GPRProcessor.moving_average(processed)
+            processed = GPRProcessor.lateral_smoothing(processed)
+        processed = GPRProcessor.normalize_traces(processed)
         return processed
 
     @staticmethod
     def detect_anomalies(data, threshold=3.0, min_distance=7, max_results=25):
+        return GPRProcessor.detect_anomaly_zones(data, threshold, min_distance, max_results)
+
+    @staticmethod
+    def detect_anomaly_zones(data, threshold=3.0, min_distance=7, max_results=25):
         values = [abs(value) for row in data for value in row]
         median = statistics.median(values)
         deviations = [abs(value - median) for value in values]
         mad = statistics.median(deviations) or 1e-9
-
-        candidates = []
-        for trace_index, row in enumerate(data):
-            for sample_index, value in enumerate(row):
+        rows = len(data)
+        cols = len(data[0])
+        score_map = []
+        mask = []
+        for row in data:
+            score_row = []
+            mask_row = []
+            for value in row:
                 score = 0.6745 * (abs(value) - median) / mad
-                if score >= threshold:
-                    label = "сильное отражение" if value > 0 else "ослабление сигнала"
-                    candidates.append(
-                        DetectionResult(trace_index, sample_index, score, value, label)
-                    )
+                score_row.append(score)
+                mask_row.append(score >= threshold)
+            score_map.append(score_row)
+            mask.append(mask_row)
 
-        candidates.sort(key=lambda item: item.score, reverse=True)
+        visited = [[False] * cols for _ in range(rows)]
+        zones = []
+        for trace in range(rows):
+            for sample in range(cols):
+                if not mask[trace][sample] or visited[trace][sample]:
+                    continue
+                component = GPRProcessor.collect_component(mask, visited, trace, sample)
+                if len(component) < 4:
+                    continue
+                zone = GPRProcessor.component_to_zone(component, data, score_map)
+                if zone.score >= threshold and GPRProcessor.is_valid_zone(zone, rows, cols):
+                    zones.append(zone)
+
+        zones.sort(key=lambda item: (item.confidence, item.score, item.area), reverse=True)
         selected = []
-        for item in candidates:
+        for zone in zones:
             too_close = any(
-                abs(item.trace_index - prev.trace_index) <= min_distance
-                and abs(item.sample_index - prev.sample_index) <= min_distance
+                abs(zone.trace_index - prev.trace_index) <= min_distance
+                and abs(zone.sample_index - prev.sample_index) <= min_distance
                 for prev in selected
             )
             if not too_close:
-                selected.append(item)
+                selected.append(zone)
             if len(selected) >= max_results:
                 break
         return selected
+
+    @staticmethod
+    def is_valid_zone(zone, rows, cols):
+        top_margin = max(3, int(cols * 0.04))
+        bottom_margin = max(3, int(cols * 0.035))
+        if zone.sample_from < top_margin:
+            return False
+        if zone.sample_to >= cols - bottom_margin:
+            return False
+
+        width = zone.trace_to - zone.trace_from + 1
+        height = zone.sample_to - zone.sample_from + 1
+        if zone.area < 5:
+            return False
+        if width == 1 and height < 6:
+            return False
+        if height == 1 and width < 6:
+            return False
+        return True
+
+    @staticmethod
+    def collect_component(mask, visited, trace, sample):
+        rows = len(mask)
+        cols = len(mask[0])
+        stack = [(trace, sample)]
+        visited[trace][sample] = True
+        component = []
+        while stack:
+            current_trace, current_sample = stack.pop()
+            component.append((current_trace, current_sample))
+            for dt, ds in ((1, 0), (-1, 0), (0, 1), (0, -1), (1, 1), (-1, -1), (1, -1), (-1, 1)):
+                next_trace = current_trace + dt
+                next_sample = current_sample + ds
+                if 0 <= next_trace < rows and 0 <= next_sample < cols:
+                    if mask[next_trace][next_sample] and not visited[next_trace][next_sample]:
+                        visited[next_trace][next_sample] = True
+                        stack.append((next_trace, next_sample))
+        return component
+
+    @staticmethod
+    def component_to_zone(component, data, score_map):
+        trace_values = [trace for trace, _sample in component]
+        sample_values = [sample for _trace, sample in component]
+        trace_from = min(trace_values)
+        trace_to = max(trace_values)
+        sample_from = min(sample_values)
+        sample_to = max(sample_values)
+        peak_trace, peak_sample = max(component, key=lambda point: score_map[point[0]][point[1]])
+        peak_score = score_map[peak_trace][peak_sample]
+        peak_amplitude = data[peak_trace][peak_sample]
+        area = len(component)
+
+        min_trace_width = 9
+        min_sample_height = 7
+        if trace_to - trace_from + 1 < min_trace_width:
+            extra = min_trace_width - (trace_to - trace_from + 1)
+            trace_from = max(0, trace_from - extra // 2)
+            trace_to = min(len(data) - 1, trace_to + math.ceil(extra / 2))
+        if sample_to - sample_from + 1 < min_sample_height:
+            extra = min_sample_height - (sample_to - sample_from + 1)
+            sample_from = max(0, sample_from - extra // 2)
+            sample_to = min(len(data[0]) - 1, sample_to + math.ceil(extra / 2))
+
+        width = trace_to - trace_from + 1
+        height = sample_to - sample_from + 1
+        density = area / max(1, width * height)
+        vertical_position = (sample_from + sample_to) / 2 / max(1, len(data[0]) - 1)
+
+        confidence = min(0.98, 0.35 + peak_score / 18 + min(area, 80) / 180 + density * 0.2)
+        if vertical_position < 0.08:
+            confidence *= 0.75
+
+        if peak_amplitude > 0:
+            label = "перспективная зона: сильное отражение"
+        else:
+            label = "перспективная зона: ослабление/пустота"
+
+        reasons = []
+        reasons.append(f"пик score={peak_score:.2f}")
+        reasons.append(f"размер зоны {width}x{height}")
+        if density >= 0.35:
+            reasons.append("связная компактная область")
+        if vertical_position >= 0.08:
+            reasons.append("расположена ниже поверхностных помех")
+        if peak_amplitude < 0:
+            reasons.append("есть признак ослабления сигнала, возможна полость или нарушение слоя")
+        else:
+            reasons.append("есть сильный контраст отражения, возможна граница объекта или каменная/металлическая структура")
+
+        return DetectionResult(
+            peak_trace,
+            peak_sample,
+            peak_score,
+            peak_amplitude,
+            label,
+            trace_from,
+            trace_to,
+            sample_from,
+            sample_to,
+            area,
+            confidence,
+            "; ".join(reasons),
+        )
 
 
 class GPRApp(tk.Tk):
@@ -167,6 +606,7 @@ class GPRApp(tk.Tk):
         self.raw_data = GPRProcessor.generate_demo_data()
         self.processed_data = []
         self.results = []
+        self.source_info = "демонстрационный набор"
         self.cell_w = 1
         self.cell_h = 1
         self.zoom = 1.0
@@ -174,6 +614,8 @@ class GPRApp(tk.Tk):
         self.pan_y = 0.0
         self.drag_start = None
         self.drag_moved = False
+        self.detection_job = None
+        self.draw_job = None
 
         self.threshold_var = tk.DoubleVar(value=3.0)
         self.bg_var = tk.BooleanVar(value=True)
@@ -239,7 +681,7 @@ class GPRApp(tk.Tk):
         ).pack(anchor="w", pady=(0, 18))
 
         ttk.Button(
-            panel, text="Загрузить CSV", style="Accent.TButton", command=self.load_csv
+            panel, text="Загрузить GPR / CSV", style="Accent.TButton", command=self.load_file
         ).pack(fill="x", pady=3)
         ttk.Button(
             panel,
@@ -262,7 +704,7 @@ class GPRApp(tk.Tk):
             from_=1.5,
             to=6.0,
             variable=self.threshold_var,
-            command=lambda _value: self.run_detection(),
+            command=self.schedule_detection,
         )
         threshold.pack(fill="x", pady=(4, 0))
         self.threshold_label = ttk.Label(panel, style="SideBody.TLabel")
@@ -272,21 +714,21 @@ class GPRApp(tk.Tk):
             panel,
             text="Удаление фоновой составляющей",
             variable=self.bg_var,
-            command=self.run_detection,
+            command=self.schedule_detection,
             style="Panel.TCheckbutton",
         ).pack(anchor="w", pady=2)
         ttk.Checkbutton(
             panel,
             text="Компенсация затухания с глубиной",
             variable=self.gain_var,
-            command=self.run_detection,
+            command=self.schedule_detection,
             style="Panel.TCheckbutton",
         ).pack(anchor="w", pady=2)
         ttk.Checkbutton(
             panel,
             text="Сглаживание шума",
             variable=self.smooth_var,
-            command=self.run_detection,
+            command=self.schedule_detection,
             style="Panel.TCheckbutton",
         ).pack(anchor="w", pady=2)
 
@@ -321,7 +763,7 @@ class GPRApp(tk.Tk):
         self.canvas.bind("<MouseWheel>", self.zoom_heatmap)
         self.canvas.bind("<Button-4>", self.zoom_heatmap)
         self.canvas.bind("<Button-5>", self.zoom_heatmap)
-        self.canvas.bind("<Configure>", lambda _event: self.draw_heatmap())
+        self.canvas.bind("<Configure>", self.schedule_draw)
 
         right = tk.Frame(workspace, bg=bg)
         right.grid(row=1, column=1, sticky="nsew")
@@ -331,16 +773,17 @@ class GPRApp(tk.Tk):
         ttk.Label(right, text="Список аномалий", style="Title.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 8)
         )
-        columns = ("trace", "sample", "score", "amp", "label")
+        columns = ("trace", "sample", "score", "confidence", "area", "label")
         self.tree = ttk.Treeview(right, columns=columns, show="headings", height=16)
         headings = {
             "trace": "Трасса",
             "sample": "Отсчет",
             "score": "Оценка",
-            "amp": "Амплитуда",
+            "confidence": "Увер.",
+            "area": "Зона",
             "label": "Тип",
         }
-        widths = {"trace": 62, "sample": 64, "score": 70, "amp": 80, "label": 150}
+        widths = {"trace": 62, "sample": 64, "score": 70, "confidence": 70, "area": 70, "label": 190}
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor="center")
@@ -357,25 +800,41 @@ class GPRApp(tk.Tk):
 
     def generate_demo(self):
         self.raw_data = GPRProcessor.generate_demo_data()
+        self.source_info = "демонстрационный набор"
         self.reset_view(redraw=False)
         self.status_var.set("Создан новый демонстрационный набор георадиолокационных сигналов")
         self.run_detection()
 
-    def load_csv(self):
+    def load_file(self):
         path = filedialog.askopenfilename(
-            title="Выберите CSV с трассами ГРЛ",
-            filetypes=[("CSV files", "*.csv"), ("All files", "*.*")],
+            title="Выберите GPR/GPR2/CSV файл",
+            filetypes=[
+                ("GPR files", "*.gpr *.gpr2"),
+                ("CSV files", "*.csv"),
+                ("Text/Data files", "*.txt *.dat"),
+                ("All files", "*.*"),
+            ],
         )
         if not path:
             return
         try:
-            self.raw_data = GPRProcessor.load_csv(path)
+            imported = GPRProcessor.load_file(path)
+            self.raw_data = imported.data
+            self.source_info = f"{Path(path).name}: {imported.details}"
         except Exception as exc:
             messagebox.showerror("Ошибка загрузки", str(exc))
             return
         self.reset_view(redraw=False)
-        self.status_var.set(f"Загружен файл: {Path(path).name}")
-        self.run_detection()
+        self.status_var.set(f"Загружен файл: {self.source_info}")
+        try:
+            self.run_detection()
+        except Exception as exc:
+            messagebox.showerror(
+                "Ошибка анализа",
+                "Файл был загружен, но анализ не выполнен. "
+                "Вероятно, структура .gpr/.gpr2 не соответствует автоопределенному формату.\n\n"
+                f"Подробности: {exc}",
+            )
 
     def reset_view(self, redraw=True):
         self.zoom = 1.0
@@ -387,8 +846,12 @@ class GPRApp(tk.Tk):
     def clamp_view(self):
         width = max(1, self.canvas.winfo_width())
         height = max(1, self.canvas.winfo_height())
-        data_width = width * self.zoom
-        data_height = height * self.zoom
+        if self.processed_data:
+            data_width = len(self.processed_data) * self.cell_w
+            data_height = len(self.processed_data[0]) * self.cell_h
+        else:
+            data_width = width * self.zoom
+            data_height = height * self.zoom
 
         if data_width <= width:
             self.pan_x = (width - data_width) / 2
@@ -411,9 +874,32 @@ class GPRApp(tk.Tk):
         GPRProcessor.save_csv(path, self.raw_data)
         self.status_var.set(f"CSV сохранен: {Path(path).name}")
 
+    def schedule_detection(self, _value=None):
+        if hasattr(self, "threshold_label"):
+            self.threshold_label.config(text=f"Текущее значение: {self.threshold_var.get():.2f}")
+        if self.detection_job is not None:
+            self.after_cancel(self.detection_job)
+        self.detection_job = self.after(260, self.run_scheduled_detection)
+
+    def run_scheduled_detection(self):
+        self.detection_job = None
+        self.run_detection()
+
+    def schedule_draw(self, _event=None):
+        if self.draw_job is not None:
+            self.after_cancel(self.draw_job)
+        self.draw_job = self.after(80, self.run_scheduled_draw)
+
+    def run_scheduled_draw(self):
+        self.draw_job = None
+        self.draw_heatmap()
+
     def run_detection(self):
         if not self.raw_data:
             return
+        if self.detection_job is not None:
+            self.after_cancel(self.detection_job)
+            self.detection_job = None
         self.threshold_label.config(text=f"Текущее значение: {self.threshold_var.get():.2f}")
         self.processed_data = GPRProcessor.preprocess(
             self.raw_data,
@@ -428,8 +914,9 @@ class GPRApp(tk.Tk):
         self.draw_heatmap()
         self.draw_trace(self.results[0].trace_index if self.results else 0)
         self.status_var.set(
+            f"{self.source_info}\n"
             f"Трасс: {len(self.raw_data)}, отсчетов: {len(self.raw_data[0])}, "
-            f"найдено аномалий: {len(self.results)}"
+            f"зон интереса: {len(self.results)}"
         )
 
     def refresh_table(self):
@@ -444,7 +931,8 @@ class GPRApp(tk.Tk):
                     item.trace_index,
                     item.sample_index,
                     f"{item.score:.2f}",
-                    f"{item.amplitude:.3f}",
+                    f"{item.confidence * 100:.0f}%",
+                    f"{item.trace_to - item.trace_from + 1}x{item.sample_to - item.sample_from + 1}",
                     item.label,
                 ),
             )
@@ -457,13 +945,15 @@ class GPRApp(tk.Tk):
         height = max(1, self.canvas.winfo_height())
         rows = len(self.processed_data)
         cols = len(self.processed_data[0])
-        self.clamp_view()
         self.cell_w = (width / rows) * self.zoom
         self.cell_h = (height / cols) * self.zoom
-        max_abs = max(abs(value) for row in self.processed_data for value in row) or 1
+        self.clamp_view()
+        max_abs = self.display_scale(self.processed_data)
 
-        step_trace = max(1, int(rows / (140 * self.zoom)))
-        step_sample = max(1, int(cols / (260 * self.zoom)))
+        target_traces = min(rows, int(180 + 35 * self.zoom))
+        target_samples = min(cols, int(145 + 20 * self.zoom))
+        step_trace = max(1, math.ceil(rows / max(1, target_traces)))
+        step_sample = max(1, math.ceil(cols / max(1, target_samples)))
         for trace in range(0, rows, step_trace):
             for sample in range(0, cols, step_sample):
                 value = self.processed_data[trace][sample] / max_abs
@@ -474,13 +964,27 @@ class GPRApp(tk.Tk):
                 y2 = self.pan_y + (sample + step_sample) * self.cell_h + 1
                 if x2 < 0 or y2 < 0 or x1 > width or y1 > height:
                     continue
-                self.canvas.create_rectangle(x1, y1, x2, y2, outline="", fill=color)
+                self.canvas.create_rectangle(x1, y1, x2, y2, outline="", fill=color, tags=("map",))
 
         for item in self.results:
             x = self.pan_x + item.trace_index * self.cell_w
             y = self.pan_y + item.sample_index * self.cell_h
             if x < -20 or y < -20 or x > width + 20 or y > height + 20:
                 continue
+            bx1 = self.pan_x + item.trace_from * self.cell_w
+            by1 = self.pan_y + item.sample_from * self.cell_h
+            bx2 = self.pan_x + (item.trace_to + 1) * self.cell_w
+            by2 = self.pan_y + (item.sample_to + 1) * self.cell_h
+            self.canvas.create_rectangle(
+                bx1,
+                by1,
+                bx2,
+                by2,
+                outline="#ffd166",
+                width=2,
+                dash=(5, 3),
+                tags=("map",),
+            )
             size = 7
             self.canvas.create_oval(
                 x - size,
@@ -489,9 +993,10 @@ class GPRApp(tk.Tk):
                 y + size,
                 outline="#ffd166",
                 width=2,
+                tags=("map",),
             )
-            self.canvas.create_line(x - 10, y, x + 10, y, fill="#17212b", width=1)
-            self.canvas.create_line(x, y - 10, x, y + 10, fill="#17212b", width=1)
+            self.canvas.create_line(x - 10, y, x + 10, y, fill="#17212b", width=1, tags=("map",))
+            self.canvas.create_line(x, y - 10, x, y + 10, fill="#17212b", width=1, tags=("map",))
 
         self.canvas.create_text(
             12,
@@ -500,6 +1005,7 @@ class GPRApp(tk.Tk):
             text=f"ось X: трассы; ось Y: время/глубина; масштаб: {self.zoom:.1f}x",
             fill="#111111",
             font=("Segoe UI", 10, "bold"),
+            tags=("overlay",),
         )
         self.canvas.create_text(
             12,
@@ -508,7 +1014,24 @@ class GPRApp(tk.Tk):
             text="колесо мыши - масштаб, зажмите левую кнопку - перемещение",
             fill="#273746",
             font=("Segoe UI", 9),
+            tags=("overlay",),
         )
+
+    @staticmethod
+    def display_scale(data):
+        sampled = []
+        row_step = max(1, len(data) // 500)
+        col_step = max(1, len(data[0]) // 500)
+        for row in data[::row_step]:
+            sampled.extend(abs(value) for value in row[::col_step])
+        if not sampled:
+            return 1
+        sampled.sort()
+        index = min(len(sampled) - 1, int(len(sampled) * 0.985))
+        scale = sampled[index]
+        if not math.isfinite(scale) or scale <= 1e-9:
+            scale = max(sampled) if sampled else 1
+        return scale or 1
 
     @staticmethod
     def value_to_color(value):
@@ -573,14 +1096,21 @@ class GPRApp(tk.Tk):
         dy = event.y - start_y
         if abs(dx) > 3 or abs(dy) > 3:
             self.drag_moved = True
+        previous_x = self.pan_x
+        previous_y = self.pan_y
         self.pan_x = original_x + dx
         self.pan_y = original_y + dy
         self.clamp_view()
-        self.draw_heatmap()
+        move_x = self.pan_x - previous_x
+        move_y = self.pan_y - previous_y
+        if move_x or move_y:
+            self.canvas.move("map", move_x, move_y)
 
     def end_pan(self, event):
         if not self.drag_moved:
             self.on_canvas_click(event)
+        else:
+            self.draw_heatmap()
         self.drag_start = None
         self.drag_moved = False
 
@@ -629,6 +1159,7 @@ class GPRApp(tk.Tk):
         lines = [
             "ОТЧЕТ ПО ОПРЕДЕЛЕНИЮ АНОМАЛИЙ ГЕОРАДИОЛОКАЦИОННЫХ СИГНАЛОВ",
             "",
+            f"Источник данных: {self.source_info}",
             f"Количество трасс: {len(self.raw_data)}",
             f"Количество отсчетов в трассе: {len(self.raw_data[0])}",
             f"Порог аномальности: {self.threshold_var.get():.2f}",
@@ -636,16 +1167,28 @@ class GPRApp(tk.Tk):
             f"Компенсация затухания: {'да' if self.gain_var.get() else 'нет'}",
             f"Сглаживание: {'да' if self.smooth_var.get() else 'нет'}",
             "",
-            "Найденные аномалии:",
+            "Найденные перспективные зоны:",
         ]
         for number, item in enumerate(self.results, start=1):
             lines.append(
-                f"{number}. трасса={item.trace_index}, отсчет={item.sample_index}, "
-                f"оценка={item.score:.2f}, амплитуда={item.amplitude:.4f}, тип={item.label}"
+                f"{number}. пик: трасса={item.trace_index}, отсчет={item.sample_index}; "
+                f"границы: трассы {item.trace_from}-{item.trace_to}, отсчеты {item.sample_from}-{item.sample_to}; "
+                f"score={item.score:.2f}, уверенность={item.confidence * 100:.0f}%, "
+                f"амплитуда={item.amplitude:.4f}, тип={item.label}"
             )
+            lines.append(f"   Обоснование: {item.reason}")
 
         if not self.results:
-            lines.append("Аномалии с заданным порогом не обнаружены.")
+            lines.append("Перспективные зоны с заданным порогом не обнаружены.")
+
+        lines.extend(
+            [
+                "",
+                "Важно: результат является предварительной интерпретацией GPR-данных.",
+                "Для принятия решения о раскопках требуется сопоставление с несколькими профилями,",
+                "геодезической привязкой, глубинной калибровкой и экспертной археологической оценкой.",
+            ]
+        )
 
         Path(path).write_text("\n".join(lines), encoding="utf-8")
         self.status_var.set(f"Отчет сохранен: {Path(path).name}")
