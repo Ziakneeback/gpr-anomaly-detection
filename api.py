@@ -62,6 +62,10 @@ def _zone_to_dict(zone):
         "amplitude": round(zone.amplitude, 6),
         "confidence": round(zone.confidence, 4),
         "area": zone.area,
+        "depth_m": round(zone.depth_m, 4),
+        "latitude": zone.latitude,
+        "longitude": zone.longitude,
+        "coordinates": zone.coordinate_text,
         "label": zone.label,
         "reason": zone.reason,
     }
@@ -71,6 +75,19 @@ def analyze_path(path: str | Path, threshold: float = 3.0, use_unet: bool = Fals
     imported = GPRProcessor.load_file(path)
     processed = GPRProcessor.preprocess(imported.data)
     zones = GPRProcessor.detect_anomalies(processed, threshold=threshold)
+    sample_count = len(processed[0])
+    gps_points = imported.gps_points or []
+    for zone in zones:
+        zone.depth_m = zone.sample_index / max(1, sample_count - 1) * 3.0
+        if gps_points and len(processed) > 1:
+            gps_index = round(zone.trace_index / (len(processed) - 1) * (len(gps_points) - 1))
+            gps_index = max(0, min(len(gps_points) - 1, gps_index))
+            gps = gps_points[gps_index]
+            zone.latitude = gps["lat"]
+            zone.longitude = gps["lon"]
+            zone.coordinate_text = f"{gps['lat']:.6f}, {gps['lon']:.6f}"
+        else:
+            zone.coordinate_text = f"trace {zone.trace_index}, sample {zone.sample_index}"
     result = {
         "status": "ok",
         "source_type": imported.source_type,
@@ -131,4 +148,3 @@ if __name__ == "__main__":
         print("FastAPI is not installed. Install dependencies from requirements.txt first.")
     else:
         print("Run the API with: uvicorn api:app --reload")
-

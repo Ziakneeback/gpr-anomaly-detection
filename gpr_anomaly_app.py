@@ -5,6 +5,7 @@ import random
 import re
 import struct
 import statistics
+import threading
 import tkinter as tk
 from dataclasses import dataclass
 from pathlib import Path
@@ -32,6 +33,10 @@ class DetectionResult:
     area: int = 1
     confidence: float = 0.0
     reason: str = ""
+    depth_m: float = 0.0
+    latitude: float | None = None
+    longitude: float | None = None
+    coordinate_text: str = ""
 
 
 @dataclass
@@ -39,6 +44,7 @@ class ImportResult:
     data: list
     source_type: str
     details: str
+    gps_points: list | None = None
 
 
 class GPRProcessor:
@@ -80,7 +86,7 @@ class GPRProcessor:
         suffix = path.suffix.lower()
         if suffix == ".csv":
             data = GPRProcessor.load_text_matrix(path)
-            return ImportResult(data, "CSV", "текстовая матрица амплитуд")
+            return ImportResult(data, "CSV", "текстовая матрица амплитуд", GPRProcessor.load_gps_for_path(path))
         if suffix in {".gpr", ".gpr2", ".txt", ".dat"}:
             return GPRProcessor.load_gpr(path)
         raise ValueError("Поддерживаются файлы .csv, .gpr, .gpr2, .txt, .dat")
@@ -88,6 +94,7 @@ class GPRProcessor:
     @staticmethod
     def load_gpr(path):
         path = Path(path)
+        gps_points = GPRProcessor.load_gps_for_path(path)
         size_mb = path.stat().st_size / (1024 * 1024)
         if size_mb > 350:
             raise ValueError(
@@ -100,7 +107,7 @@ class GPRProcessor:
 
         text_result = GPRProcessor.try_load_text_bytes(raw)
         if text_result:
-            return ImportResult(text_result, path.suffix.upper(), "распознан как текстовая матрица")
+            return ImportResult(text_result, path.suffix.upper(), "распознан как текстовая матрица", gps_points)
 
         known_result = GPRProcessor.try_load_known_gpr2(raw)
         if known_result:
@@ -108,13 +115,39 @@ class GPRProcessor:
             data, preview_details = GPRProcessor.prepare_preview_matrix(data)
             if preview_details:
                 details = f"{details}; {preview_details}"
-            return ImportResult(data, path.suffix.upper(), details)
+            return ImportResult(data, path.suffix.upper(), details, gps_points)
 
         data, details = GPRProcessor.load_binary_gpr(raw)
         data, preview_details = GPRProcessor.prepare_preview_matrix(data)
         if preview_details:
             details = f"{details}; {preview_details}"
-        return ImportResult(data, path.suffix.upper(), details)
+        return ImportResult(data, path.suffix.upper(), details, gps_points)
+
+    @staticmethod
+    def load_gps_for_path(path):
+        path = Path(path)
+        gps_path = path.with_suffix(".gps")
+        if not gps_path.exists():
+            return []
+
+        points = []
+        try:
+            with open(gps_path, "r", encoding="utf-8-sig") as file:
+                for line in file:
+                    parts = line.strip().split()
+                    if len(parts) < 7:
+                        continue
+                    lat = float(parts[2])
+                    if parts[3].upper().startswith("S"):
+                        lat = -lat
+                    lon = float(parts[4])
+                    if parts[5].upper().startswith("W"):
+                        lon = -lon
+                    alt = float(parts[6])
+                    points.append({"lat": lat, "lon": lon, "alt": alt})
+        except Exception:
+            return []
+        return points
 
     @staticmethod
     def try_load_text_bytes(raw):
@@ -607,6 +640,7 @@ class GPRApp(tk.Tk):
         self.processed_data = []
         self.results = []
         self.source_info = "демонстрационный набор"
+        self.gps_points = []
         self.cell_w = 1
         self.cell_h = 1
         self.zoom = 1.0
@@ -616,12 +650,17 @@ class GPRApp(tk.Tk):
         self.drag_moved = False
         self.detection_job = None
         self.draw_job = None
+        self.manual_analysis = False
+        self.last_no_results_alert = None
+        self.busy = False
 
         self.threshold_var = tk.DoubleVar(value=3.0)
+        self.antenna_var = tk.StringVar(value="400 МГц (1-3 м)")
         self.bg_var = tk.BooleanVar(value=True)
         self.gain_var = tk.BooleanVar(value=True)
         self.smooth_var = tk.BooleanVar(value=True)
         self.status_var = tk.StringVar(value="Загружен демонстрационный набор данных")
+        self.current_file_var = tk.StringVar(value="Файл: демонстрационные данные")
 
         self._build_ui()
         self.run_detection()
@@ -710,6 +749,17 @@ class GPRApp(tk.Tk):
         self.threshold_label = ttk.Label(panel, style="SideBody.TLabel")
         self.threshold_label.pack(anchor="w", pady=(0, 12))
 
+        ttk.Label(panel, text="Антенна / глубина", style="SideLabel.TLabel").pack(anchor="w")
+        antenna_box = ttk.Combobox(
+            panel,
+            textvariable=self.antenna_var,
+            values=("1000 МГц (до 1 м)", "400 МГц (1-3 м)"),
+            state="readonly",
+            height=2,
+        )
+        antenna_box.pack(fill="x", pady=(4, 12))
+        antenna_box.bind("<<ComboboxSelected>>", self.schedule_detection)
+
         ttk.Checkbutton(
             panel,
             text="Удаление фоновой составляющей",
@@ -734,13 +784,19 @@ class GPRApp(tk.Tk):
 
         ttk.Separator(panel).pack(fill="x", pady=14)
         ttk.Button(
-            panel, text="Выполнить анализ", style="Accent.TButton", command=self.run_detection
+            panel, text="Выполнить анализ", style="Accent.TButton", command=self.run_manual_detection
         ).pack(fill="x", pady=3)
         ttk.Button(
             panel, text="Сохранить отчет", style="Action.TButton", command=self.save_report
         ).pack(fill="x", pady=3)
 
         ttk.Separator(panel).pack(fill="x", pady=14)
+        ttk.Label(panel, text="Загруженный файл", style="SideLabel.TLabel").pack(anchor="w")
+        ttk.Label(panel, textvariable=self.current_file_var, wraplength=250, style="SideBody.TLabel").pack(
+            fill="x", anchor="w", pady=(4, 8)
+        )
+        self.progress_bar = ttk.Progressbar(panel, mode="indeterminate")
+        self.progress_bar.pack(fill="x", pady=(0, 10))
         ttk.Label(panel, textvariable=self.status_var, wraplength=250, style="Status.TLabel").pack(fill="x", anchor="w")
 
         workspace = tk.Frame(root, bg=bg)
@@ -773,17 +829,28 @@ class GPRApp(tk.Tk):
         ttk.Label(right, text="Список аномалий", style="Title.TLabel").grid(
             row=0, column=0, sticky="w", pady=(0, 8)
         )
-        columns = ("trace", "sample", "score", "confidence", "area", "label")
+        columns = ("trace", "sample", "depth", "score", "confidence", "area", "coords", "label")
         self.tree = ttk.Treeview(right, columns=columns, show="headings", height=16)
         headings = {
             "trace": "Трасса",
             "sample": "Отсчет",
+            "depth": "Глубина",
             "score": "Оценка",
             "confidence": "Увер.",
             "area": "Зона",
+            "coords": "Координаты",
             "label": "Тип",
         }
-        widths = {"trace": 62, "sample": 64, "score": 70, "confidence": 70, "area": 70, "label": 190}
+        widths = {
+            "trace": 58,
+            "sample": 60,
+            "depth": 72,
+            "score": 64,
+            "confidence": 64,
+            "area": 62,
+            "coords": 150,
+            "label": 180,
+        }
         for column in columns:
             self.tree.heading(column, text=headings[column])
             self.tree.column(column, width=widths[column], anchor="center")
@@ -799,13 +866,21 @@ class GPRApp(tk.Tk):
         self.trace_canvas.grid(row=3, column=0, sticky="ew")
 
     def generate_demo(self):
+        if self.busy:
+            return
         self.raw_data = GPRProcessor.generate_demo_data()
         self.source_info = "демонстрационный набор"
+        self.gps_points = []
+        self.current_file_var.set("Файл: демонстрационные данные")
         self.reset_view(redraw=False)
         self.status_var.set("Создан новый демонстрационный набор георадиолокационных сигналов")
-        self.run_detection()
+        self.run_detection(show_alerts=True)
+        self.show_success("Демо-данные готовы", "Демонстрационный набор создан и проанализирован.")
 
     def load_file(self):
+        if self.busy:
+            messagebox.showinfo("Операция выполняется", "Дождитесь завершения текущей загрузки или анализа.")
+            return
         path = filedialog.askopenfilename(
             title="Выберите GPR/GPR2/CSV файл",
             filetypes=[
@@ -817,24 +892,97 @@ class GPRApp(tk.Tk):
         )
         if not path:
             return
+        self.start_busy(f"Загрузка файла: {Path(path).name}")
+        threading.Thread(target=self.load_file_worker, args=(path,), daemon=True).start()
+
+    def load_file_worker(self, path):
         try:
             imported = GPRProcessor.load_file(path)
-            self.raw_data = imported.data
-            self.source_info = f"{Path(path).name}: {imported.details}"
+            self.validate_imported_data(imported.data)
         except Exception as exc:
-            messagebox.showerror("Ошибка загрузки", str(exc))
+            self.after(0, lambda exc=exc: self.finish_load_error(exc))
             return
+        self.after(0, lambda: self.finish_load_success(path, imported))
+
+    def finish_load_error(self, exc):
+        self.stop_busy()
+        self.show_load_error(exc)
+
+    def finish_load_success(self, path, imported):
+        self.raw_data = imported.data
+        self.source_info = f"{Path(path).name}: {imported.details}"
+        self.gps_points = imported.gps_points or []
+        self.current_file_var.set(f"Файл: {Path(path).name}")
         self.reset_view(redraw=False)
         self.status_var.set(f"Загружен файл: {self.source_info}")
-        try:
-            self.run_detection()
-        except Exception as exc:
-            messagebox.showerror(
-                "Ошибка анализа",
-                "Файл был загружен, но анализ не выполнен. "
-                "Вероятно, структура .gpr/.gpr2 не соответствует автоопределенному формату.\n\n"
-                f"Подробности: {exc}",
-            )
+        self.stop_busy()
+        self.show_success(
+            "Файл загружен",
+            f"Файл {Path(path).name} успешно загружен.\n"
+            f"Трасс: {len(self.raw_data)}, отсчетов: {len(self.raw_data[0])}, GPS-точек: {len(self.gps_points)}."
+        )
+        self.run_detection_async(show_alerts=True, success_alert=True)
+
+    def start_busy(self, text):
+        self.busy = True
+        self.status_var.set(text)
+        self.configure(cursor="watch")
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.start(12)
+        self.update_idletasks()
+
+    def stop_busy(self):
+        self.busy = False
+        self.configure(cursor="")
+        if hasattr(self, "progress_bar"):
+            self.progress_bar.stop()
+
+    def show_success(self, title, message):
+        messagebox.showinfo(title, message)
+
+    def validate_imported_data(self, data):
+        if not data:
+            raise ValueError("Файл не содержит числовых данных.")
+        if not data[0]:
+            raise ValueError("Трассы не содержат отсчетов.")
+        width = len(data[0])
+        if width < 8 or len(data) < 4:
+            raise ValueError("Слишком мало трасс или отсчетов для построения B-scan.")
+        if any(len(row) != width for row in data):
+            raise ValueError("Матрица данных повреждена: строки имеют разную длину.")
+        checked = 0
+        for row in data[: min(len(data), 50)]:
+            for value in row[: min(width, 50)]:
+                checked += 1
+                if not isinstance(value, (int, float)) or not math.isfinite(value):
+                    raise ValueError("Файл содержит некорректные числовые значения.")
+        if checked == 0:
+            raise ValueError("Не удалось найти числовые значения для анализа.")
+
+    def show_load_error(self, exc):
+        message = str(exc)
+        lower = message.lower()
+        if "поддерживаются" in lower:
+            advice = "Выберите файл .gpr, .gpr2, .csv, .txt или .dat."
+        elif "распознать" in lower or "формат" in lower:
+            advice = "Экспортируйте профиль в CSV или пришлите пример формата прибора для добавления точного парсера."
+        elif "слишком большой" in lower:
+            advice = "Разделите профиль на меньшие фрагменты или экспортируйте нужный участок."
+        elif "пуст" in lower:
+            advice = "Проверьте, что выбран правильный файл и он не поврежден."
+        else:
+            advice = "Проверьте файл, его расширение и наличие данных."
+        messagebox.showerror("Ошибка загрузки файла", f"{message}\n\nЧто сделать: {advice}")
+        self.status_var.set("Файл не загружен: проверьте формат или структуру данных")
+
+    def show_analysis_error(self, exc):
+        messagebox.showerror(
+            "Ошибка анализа",
+            "Файл был загружен, но анализ не выполнен.\n\n"
+            f"Причина: {exc}\n\n"
+            "Что сделать: попробуйте другой режим фильтрации, проверьте формат файла или экспортируйте профиль в CSV."
+        )
+        self.status_var.set("Анализ не выполнен: проверьте параметры и структуру файла")
 
     def reset_view(self, redraw=True):
         self.zoom = 1.0
@@ -883,7 +1031,81 @@ class GPRApp(tk.Tk):
 
     def run_scheduled_detection(self):
         self.detection_job = None
-        self.run_detection()
+        self.run_detection_async(show_alerts=False, success_alert=False)
+
+    def run_manual_detection(self):
+        self.run_detection_async(show_alerts=True, success_alert=True)
+
+    def run_detection_async(self, show_alerts=False, success_alert=False):
+        if self.busy:
+            if show_alerts:
+                messagebox.showinfo("Операция выполняется", "Дождитесь завершения текущей операции.")
+            return
+        if not self.raw_data:
+            if show_alerts:
+                messagebox.showwarning(
+                    "Нет данных",
+                    "Сначала загрузите GPR/GPR2/CSV файл или создайте демонстрационные сигналы."
+                )
+            return
+        self.start_busy("Выполняется анализ данных...")
+        settings = {
+            "remove_background": self.bg_var.get(),
+            "gain": self.gain_var.get(),
+            "smoothing": self.smooth_var.get(),
+            "threshold": self.threshold_var.get(),
+        }
+        threading.Thread(
+            target=self.detection_worker,
+            args=(settings, show_alerts, success_alert),
+            daemon=True,
+        ).start()
+
+    def detection_worker(self, settings, show_alerts, success_alert):
+        try:
+            self.validate_imported_data(self.raw_data)
+            processed = GPRProcessor.preprocess(
+                self.raw_data,
+                remove_background=settings["remove_background"],
+                gain=settings["gain"],
+                smoothing=settings["smoothing"],
+            )
+            results = GPRProcessor.detect_anomalies(
+                processed, threshold=settings["threshold"]
+            )
+        except Exception as exc:
+            self.after(0, lambda exc=exc: self.finish_detection_error(exc, show_alerts))
+            return
+        self.after(0, lambda: self.finish_detection_success(processed, results, show_alerts, success_alert))
+
+    def finish_detection_error(self, exc, show_alerts):
+        self.stop_busy()
+        if show_alerts:
+            self.show_analysis_error(exc)
+        else:
+            self.status_var.set(f"Ошибка анализа: {exc}")
+
+    def finish_detection_success(self, processed, results, show_alerts, success_alert):
+        self.processed_data = processed
+        self.results = results
+        self.annotate_results()
+        self.refresh_table()
+        self.draw_heatmap()
+        self.draw_trace(self.results[0].trace_index if self.results else 0)
+        self.status_var.set(
+            f"{self.source_info}\n"
+            f"Трасс: {len(self.raw_data)}, отсчетов: {len(self.raw_data[0])}, "
+            f"зон интереса: {len(self.results)}, GPS точек: {len(self.gps_points)}"
+        )
+        self.stop_busy()
+        if not self.results:
+            self.show_no_anomalies_alert(show_alerts)
+            return
+        if success_alert:
+            self.show_success(
+                "Анализ завершен",
+                f"Анализ выполнен успешно.\nНайдено зон интереса: {len(self.results)}."
+            )
 
     def schedule_draw(self, _event=None):
         if self.draw_job is not None:
@@ -894,30 +1116,103 @@ class GPRApp(tk.Tk):
         self.draw_job = None
         self.draw_heatmap()
 
-    def run_detection(self):
+    def run_detection(self, show_alerts=False):
         if not self.raw_data:
+            if show_alerts:
+                messagebox.showwarning(
+                    "Нет данных",
+                    "Сначала загрузите GPR/GPR2/CSV файл или создайте демонстрационные сигналы."
+                )
             return
         if self.detection_job is not None:
             self.after_cancel(self.detection_job)
             self.detection_job = None
-        self.threshold_label.config(text=f"Текущее значение: {self.threshold_var.get():.2f}")
-        self.processed_data = GPRProcessor.preprocess(
-            self.raw_data,
-            remove_background=self.bg_var.get(),
-            gain=self.gain_var.get(),
-            smoothing=self.smooth_var.get(),
-        )
-        self.results = GPRProcessor.detect_anomalies(
-            self.processed_data, threshold=self.threshold_var.get()
-        )
+        try:
+            self.validate_imported_data(self.raw_data)
+            self.threshold_label.config(text=f"Текущее значение: {self.threshold_var.get():.2f}")
+            self.processed_data = GPRProcessor.preprocess(
+                self.raw_data,
+                remove_background=self.bg_var.get(),
+                gain=self.gain_var.get(),
+                smoothing=self.smooth_var.get(),
+            )
+            self.results = GPRProcessor.detect_anomalies(
+                self.processed_data, threshold=self.threshold_var.get()
+            )
+        except Exception as exc:
+            if show_alerts:
+                self.show_analysis_error(exc)
+            else:
+                self.status_var.set(f"Ошибка анализа: {exc}")
+            return
+        self.annotate_results()
         self.refresh_table()
         self.draw_heatmap()
         self.draw_trace(self.results[0].trace_index if self.results else 0)
         self.status_var.set(
             f"{self.source_info}\n"
             f"Трасс: {len(self.raw_data)}, отсчетов: {len(self.raw_data[0])}, "
-            f"зон интереса: {len(self.results)}"
+            f"зон интереса: {len(self.results)}, GPS точек: {len(self.gps_points)}"
         )
+        if not self.results:
+            self.show_no_anomalies_alert(show_alerts)
+
+    def show_no_anomalies_alert(self, show_alerts):
+        signature = (
+            self.source_info,
+            round(self.threshold_var.get(), 2),
+            self.bg_var.get(),
+            self.gain_var.get(),
+            self.smooth_var.get(),
+            self.antenna_var.get(),
+        )
+        self.status_var.set(
+            f"{self.source_info}\n"
+            f"Аномальные зоны не найдены. Попробуйте снизить порог или изменить фильтры."
+        )
+        if show_alerts and self.last_no_results_alert != signature:
+            self.last_no_results_alert = signature
+            messagebox.showinfo(
+                "Аномалии не найдены",
+                "При текущих настройках перспективные зоны не обнаружены.\n\n"
+                "Что можно попробовать:\n"
+                "1. Снизить порог аномальности.\n"
+                "2. Включить удаление фона и сглаживание.\n"
+                "3. Проверить, правильно ли выбрана антенна.\n"
+                "4. Убедиться, что файл содержит профиль с полезным сигналом."
+            )
+
+    def max_depth_m(self):
+        if self.antenna_var.get().startswith("1000"):
+            return 1.0
+        return 3.0
+
+    def annotate_results(self):
+        if not self.results or not self.processed_data:
+            return
+        sample_count = len(self.processed_data[0])
+        max_depth = self.max_depth_m()
+        for item in self.results:
+            item.depth_m = item.sample_index / max(1, sample_count - 1) * max_depth
+            gps = self.gps_for_trace(item.trace_index)
+            if gps:
+                item.latitude = gps["lat"]
+                item.longitude = gps["lon"]
+                item.coordinate_text = f"{gps['lat']:.6f}, {gps['lon']:.6f}"
+            else:
+                item.latitude = None
+                item.longitude = None
+                item.coordinate_text = f"трасса {item.trace_index}, отсчет {item.sample_index}"
+
+    def gps_for_trace(self, trace_index):
+        if not self.gps_points or not self.processed_data:
+            return None
+        if len(self.processed_data) <= 1:
+            gps_index = 0
+        else:
+            gps_index = round(trace_index / (len(self.processed_data) - 1) * (len(self.gps_points) - 1))
+        gps_index = max(0, min(len(self.gps_points) - 1, gps_index))
+        return self.gps_points[gps_index]
 
     def refresh_table(self):
         for row in self.tree.get_children():
@@ -930,9 +1225,11 @@ class GPRApp(tk.Tk):
                 values=(
                     item.trace_index,
                     item.sample_index,
+                    f"{item.depth_m:.2f} м",
                     f"{item.score:.2f}",
                     f"{item.confidence * 100:.0f}%",
                     f"{item.trace_to - item.trace_from + 1}x{item.sample_to - item.sample_from + 1}",
+                    item.coordinate_text,
                     item.label,
                 ),
             )
@@ -1148,6 +1445,27 @@ class GPRApp(tk.Tk):
         self.draw_trace(item.trace_index)
 
     def save_report(self):
+        if not self.raw_data:
+            messagebox.showwarning(
+                "Нет данных для отчета",
+                "Сначала загрузите файл или создайте демонстрационные сигналы."
+            )
+            return
+        if not self.processed_data:
+            messagebox.showwarning(
+                "Анализ не выполнен",
+                "Сначала выполните анализ, затем сохраните отчет."
+            )
+            return
+        if not self.results:
+            should_save = messagebox.askyesno(
+                "Аномалии не найдены",
+                "При текущих настройках зоны интереса не обнаружены.\n\n"
+                "Сохранить отчет с нулевым результатом?"
+            )
+            if not should_save:
+                return
+
         path = filedialog.asksaveasfilename(
             title="Сохранить отчет",
             defaultextension=".txt",
@@ -1162,6 +1480,9 @@ class GPRApp(tk.Tk):
             f"Источник данных: {self.source_info}",
             f"Количество трасс: {len(self.raw_data)}",
             f"Количество отсчетов в трассе: {len(self.raw_data[0])}",
+            f"Выбранная антенна: {self.antenna_var.get()}",
+            f"Максимальная расчетная глубина: {self.max_depth_m():.2f} м",
+            f"Количество GPS-точек: {len(self.gps_points)}",
             f"Порог аномальности: {self.threshold_var.get():.2f}",
             f"Удаление фона: {'да' if self.bg_var.get() else 'нет'}",
             f"Компенсация затухания: {'да' if self.gain_var.get() else 'нет'}",
@@ -1173,6 +1494,7 @@ class GPRApp(tk.Tk):
             lines.append(
                 f"{number}. пик: трасса={item.trace_index}, отсчет={item.sample_index}; "
                 f"границы: трассы {item.trace_from}-{item.trace_to}, отсчеты {item.sample_from}-{item.sample_to}; "
+                f"глубина={item.depth_m:.2f} м; координаты={item.coordinate_text}; "
                 f"score={item.score:.2f}, уверенность={item.confidence * 100:.0f}%, "
                 f"амплитуда={item.amplitude:.4f}, тип={item.label}"
             )
@@ -1192,6 +1514,7 @@ class GPRApp(tk.Tk):
 
         Path(path).write_text("\n".join(lines), encoding="utf-8")
         self.status_var.set(f"Отчет сохранен: {Path(path).name}")
+        self.show_success("Отчет сохранен", f"Отчет успешно сохранен:\n{path}")
 
 
 if __name__ == "__main__":
